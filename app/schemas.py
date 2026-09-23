@@ -1,9 +1,9 @@
 """API 响应模型（Pydantic v2）。"""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer
 
 
 class DiagnosticOut(BaseModel):
@@ -97,6 +97,27 @@ class ConsistencyCheckRequest(BaseModel):
         description="已完成（status=ready）任务 ID，2～5 个；不得重复",
         min_length=2,
         max_length=5,
+    )
+    level: Optional[Literal["patient", "study", "series", "sop"]] = Field(
+        default=None,
+        description=(
+            "差异明细分页层级。不传：返回原完整计数报告（向后兼容）；"
+            "传入时在顶层额外返回该层级按固定业务键排序的 items / next_cursor / has_more，"
+            "报告内的完整 *_count 与 overall_status 仍然给出。"
+        ),
+    )
+    limit: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=200,
+        description="每页差异明细条数，1～200；level 存在且未传时使用服务端默认值 50",
+    )
+    cursor: Optional[str] = Field(
+        default=None,
+        description=(
+            "上一页响应返回的不透明 next_cursor；游标绑定本次任务集合与 level，"
+            "篡改、过期或跨任务集合/层级复用将返回 400"
+        ),
     )
 
     @field_validator("job_ids")
@@ -192,6 +213,31 @@ class UidLevelReport(BaseModel):
     differences: list[UidMappingDifference]
 
 
+class ConsistencyDifferenceItem(BaseModel):
+    """统一的差异明细条目（患者层 / UID 层），按类型只填充对应字段。"""
+    level: str = Field(description="patient | study | series | sop")
+    difference_type: str = Field(
+        description="患者层：conflict | date_shift_mismatch | only_in_one_job；"
+        "UID 层：conflict | only_in_one_job | uid_new_collision"
+    )
+    patient_key: Optional[str] = Field(default=None, description="患者层条目的业务键")
+    old_uid: Optional[str] = Field(
+        default=None, description="UID 层原始 UID；uid_new_collision 时为空"
+    )
+    new_uid: Optional[str] = Field(default=None, description="uid_new_collision 时的新 UID")
+    values: Optional[dict[str, PatientMappingValue]] = Field(
+        default=None, description="患者层：任务 ID -> 该任务下的稳定伪名/日期偏移"
+    )
+    mappings: Optional[dict[str, str]] = Field(
+        default=None, description="UID 层 conflict / only_in_one_job：任务 ID -> 新 UID"
+    )
+    sources: Optional[dict[str, str]] = Field(
+        default=None, description="uid_new_collision：任务 ID -> 各自的原始 UID"
+    )
+    present_in: list[str] = []
+    missing_in: list[str] = []
+
+
 class ConsistencyCheckOut(BaseModel):
     overall_status: str = Field(
         description="consistent（无任何冲突） | inconsistent（存在伪名或 UID 冲突）"
@@ -207,6 +253,38 @@ class ConsistencyCheckOut(BaseModel):
         "uid_conflict / uid_new_collision / "
         "patient_only_in_one_job / uid_only_in_one_job 计数"
     )
+    # 仅当请求传入 level 时出现（model_serializer 会在未分页时剔除这三个键）
+    items: Optional[list[ConsistencyDifferenceItem]] = Field(
+        default=None,
+        description="请求 level 对应层级的差异明细，按固定业务键排序（见层级内排序规则）",
+    )
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description="下一页不透明游标；has_more=false 时为 null。游标绑定任务集合与 level",
+    )
+    has_more: Optional[bool] = Field(
+        default=None, description="该层级是否还有后续差异明细"
+    )
+
+    @model_serializer(mode="plain")
+    def _serialize(self):
+        data = {
+            "overall_status": self.overall_status,
+            "secret_fingerprint": self.secret_fingerprint,
+            "jobs": [j.model_dump() for j in self.jobs],
+            "patient_mappings": self.patient_mappings.model_dump(),
+            "uid_mappings": [u.model_dump() for u in self.uid_mappings],
+            "summary": self.summary,
+        }
+        # 未请求分页（level 缺省）时保持与旧版响应完全一致，不输出分页键
+        if self.items is not None or self.next_cursor is not None or self.has_more is not None:
+            data["items"] = (
+                [i.model_dump(exclude_none=True) for i in self.items]
+                if self.items is not None else None
+            )
+            data["next_cursor"] = self.next_cursor
+            data["has_more"] = self.has_more
+        return data
 
 
 class ConsistencyErrorDetail(BaseModel):
@@ -217,6 +295,17 @@ class ConsistencyErrorDetail(BaseModel):
     missing_job_ids: list[str] = []
     not_ready_jobs: list[dict[str, str]] = []
     fingerprints: dict[str, str] = {}
+
+
+class CursorErrorDetail(BaseModel):
+    code: str = Field(
+        description=(
+            "INVALID_CURSOR（游标格式/签名非法、已被篡改，或服务重启后旧游标失效） | "
+            "CURSOR_EXPIRED（游标超过有效期） | "
+            "CURSOR_SCOPE_MISMATCH（游标被复用到其他任务集合或其他 level）"
+        )
+    )
+    message: str
 
 
 class ErrorOut(BaseModel):

@@ -13,13 +13,28 @@
 """
 from __future__ import annotations
 
+import bisect
 from collections import defaultdict
+from typing import Any, Optional
 
 from .anonymizer import JobResult
 from .jobs import Job
+from . import pagination
 
 # 每个 UID 层级差异明细条目上限（计数始终完整，仅截断明细，防止 JSON 过大）
 _MAX_DIFF_ENTRIES_PER_LEVEL = 500
+
+# 差异明细分页的默认/最大页长（请求未传 limit 时使用默认值）
+DEFAULT_DIFF_PAGE_LIMIT = 50
+MAX_DIFF_PAGE_LIMIT = 200
+
+# 固定业务排序键中的类型段（决定同一层级内冲突/碰撞/覆盖差异的先后顺序）
+_RANK_TYPE: dict[str, int] = {
+    "conflict": 0,
+    "date_shift_mismatch": 0,
+    "uid_new_collision": 1,
+    "only_in_one_job": 2,
+}
 
 
 def _job_counts(job: Job) -> dict[str, int]:
@@ -86,6 +101,7 @@ def _compare_patients(jobs: list[Job]) -> dict:
                 # 同一患者派生出不同伪名：确定性派生被破坏（真正的冲突）
                 conflict_count += 1
                 differences.append({
+                    "level": "patient",
                     "patient_key": key,
                     "difference_type": "conflict",
                     "values": values,
@@ -96,6 +112,7 @@ def _compare_patients(jobs: list[Job]) -> dict:
                 # 伪名一致但日期偏移不同：通常因各任务 shift_dates 开关不同
                 shift_mismatch_count += 1
                 differences.append({
+                    "level": "patient",
                     "patient_key": key,
                     "difference_type": "date_shift_mismatch",
                     "values": values,
@@ -105,6 +122,7 @@ def _compare_patients(jobs: list[Job]) -> dict:
         else:
             only_count += 1
             differences.append({
+                "level": "patient",
                 "patient_key": key,
                 "difference_type": "only_in_one_job",
                 "values": values,
@@ -120,6 +138,8 @@ def _compare_patients(jobs: list[Job]) -> dict:
         "only_in_one_job_count": only_count,
         "differences": differences,
         "shift_dates_consistent": shift_consistent,
+        # 内部使用：完整、按固定业务键排序的差异列表（患者层不做截断）
+        "_all_differences": differences,
     }
 
 
@@ -207,10 +227,16 @@ def _compare_uid_level(jobs: list[Job], level: str) -> dict:
                 "missing_in": [jid for jid in job_ids if jid not in sources],
             })
 
-    # 冲突/碰撞是关键差异，始终完整给出；覆盖范围差异可能成千上万，仅保留前若干条
+    # 冲突/碰撞是关键差异，始终完整给出；覆盖范围差异可能成千上万，仅保留前若干条。
+    # 完整列表先按固定业务键排序（见 _diff_sort_key），再在其上做截断，保证分页与
+    # 截断使用同一个稳定顺序。
+    all_differences = sorted(
+        conflicts + collisions + coverage, key=lambda d: _diff_sort_key(level, d)
+    )
     budget = _MAX_DIFF_ENTRIES_PER_LEVEL - len(conflicts) - len(collisions)
     kept_coverage = coverage[:max(budget, 0)]
     truncated = len(kept_coverage) < len(coverage)
+    embedded = conflicts + collisions + kept_coverage
     return {
         "level": level,
         "checked_old_uids": checked,
@@ -218,7 +244,9 @@ def _compare_uid_level(jobs: list[Job], level: str) -> dict:
         "only_in_one_job_count": only_count,
         "new_uid_collision_count": collision_count,
         "differences_truncated": truncated,
-        "differences": conflicts + collisions + kept_coverage,
+        "differences": embedded,
+        # 内部使用：完整、按固定业务键排序的差异列表（供分页，不受截断影响）
+        "_all_differences": all_differences,
     }
 
 
@@ -227,6 +255,40 @@ def _compare_uid_level(jobs: list[Job], level: str) -> dict:
 # --------------------------------------------------------------------------- #
 def build_report(jobs: list[Job]) -> dict:
     """对已校验（存在、ready、同密钥指纹）的任务构建一致性报告。"""
+    return report_without_private(build_full_report(jobs))
+
+
+# --------------------------------------------------------------------------- #
+# 差异明细分页
+# --------------------------------------------------------------------------- #
+def _diff_sort_key(level: str, diff: dict) -> tuple:
+    """跨层级统一的固定业务排序键。
+
+    先按差异类型（conflict/date_shift_mismatch -> uid_new_collision ->
+    only_in_one_job），再按该条目的业务标识（患者 key / 原始 UID / 新 UID），
+    保证页码顺序稳定、与比对执行顺序无关。
+    """
+    dtype = diff["difference_type"]
+    type_rank = _RANK_TYPE.get(dtype, 9)
+    if level == "patient":
+        identity = diff.get("patient_key") or ""
+    elif dtype == "uid_new_collision":
+        identity = diff.get("new_uid") or ""
+    else:
+        identity = diff.get("old_uid") or ""
+    return (type_rank, identity)
+
+
+def _full_differences(report: dict, level: str) -> list[dict]:
+    """从内部报告对象取出某层级的完整（未截断）差异列表。"""
+    if level == "patient":
+        return report["patient_mappings"]["_all_differences"]
+    layer = next(l for l in report["uid_mappings"] if l["level"] == level)
+    return layer["_all_differences"]
+
+
+def build_full_report(jobs: list[Job]) -> dict:
+    """同 build_report，但保留各层级 ``_all_differences`` 供分页使用。"""
     patients = _compare_patients(jobs)
     uid_layers = [_compare_uid_level(jobs, level) for level in ("study", "series", "sop")]
 
@@ -255,3 +317,50 @@ def build_report(jobs: list[Job]) -> dict:
             "uid_only_in_one_job": uid_only,
         },
     }
+
+
+def report_without_private(report: dict) -> dict:
+    """剥离内部的 ``_all_differences`` 键，得到可直接序列化的报告。"""
+    patients_out = {k: v for k, v in report["patient_mappings"].items()
+                    if not k.startswith("_")}
+    uid_layers_out = [
+        {k: v for k, v in layer.items() if not k.startswith("_")}
+        for layer in report["uid_mappings"]
+    ]
+    return {**report, "patient_mappings": patients_out, "uid_mappings": uid_layers_out}
+
+
+def page_differences(
+    report: dict,
+    *,
+    job_ids: list[str],
+    level: str,
+    limit: int,
+    after: Optional[list[Any]],
+) -> dict:
+    """在完整差异列表上按固定业务键做 keyset 分页。
+
+    返回 {"items", "next_cursor", "has_more"}；游标绑定任务集合与 level。
+    """
+    differences = sorted(
+        _full_differences(report, level),
+        key=lambda d: _diff_sort_key(level, d),
+    )
+    sort_keys = [_diff_sort_key(level, d) for d in differences]
+    if after is not None:
+        # 游标来自同一作用域（已由 CursorCodec 校验）。底层任务结果若在翻页间
+        # 发生变化导致该键消失，也能稳定定位到“大于游标键”的首条，不重不漏。
+        start = bisect.bisect_right(sort_keys, tuple(after))
+    else:
+        start = 0
+
+    window = differences[start:start + limit + 1]
+    has_more = len(window) > limit
+    page = window[:limit]
+    next_cursor: Optional[str] = None
+    if has_more and page:
+        last_key = list(_diff_sort_key(level, page[-1]))
+        next_cursor = pagination.codec.encode(
+            job_ids=job_ids, level=level, after=last_key
+        )
+    return {"items": page, "next_cursor": next_cursor, "has_more": has_more}

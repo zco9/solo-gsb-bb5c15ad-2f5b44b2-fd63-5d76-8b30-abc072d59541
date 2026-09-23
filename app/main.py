@@ -11,13 +11,15 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from .anonymizer import JobResult
-from . import consistency
+from . import consistency, pagination
 from .config import settings
 from .jobs import registry
 from .schemas import (
     ConsistencyCheckOut,
     ConsistencyCheckRequest,
+    ConsistencyDifferenceItem,
     ConsistencyErrorDetail,
+    CursorErrorDetail,
     FileOut,
     JobOut,
     PatientOut,
@@ -186,6 +188,8 @@ async def create_job(
     tags=["jobs"],
     summary="核对多个已完成任务的密钥指纹、患者稳定伪名与 Study/Series/SOP UID 映射",
     responses={
+        400: {"model": CursorErrorDetail,
+              "description": "差异明细分页游标非法：篡改/格式错误、过期或跨任务集合/层级复用"},
         404: {"model": ConsistencyErrorDetail, "description": "部分任务不存在或已过期"},
         409: {"model": ConsistencyErrorDetail,
               "description": "部分任务未完成，或任务间密钥指纹不一致"},
@@ -236,7 +240,39 @@ def consistency_check(body: ConsistencyCheckRequest) -> ConsistencyCheckOut:
             },
         )
 
-    return ConsistencyCheckOut.model_validate(consistency.build_report(jobs))
+    # 含内部完整差异列表（_all_differences）的报告：计数/状态口径不变
+    report = consistency.build_full_report(jobs)
+    page = None
+    if body.level is not None:
+        # 游标必须绑定本次任务集合与筛选层级；篡改/过期/跨条件复用一律 400
+        try:
+            after = pagination.codec.decode(
+                body.cursor or "",
+                job_ids=body.job_ids,
+                level=body.level,
+            )
+        except pagination.CursorError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+        limit = body.limit or consistency.DEFAULT_DIFF_PAGE_LIMIT
+        page = consistency.page_differences(
+            report,
+            job_ids=body.job_ids,
+            level=body.level,
+            limit=limit,
+            after=after,
+        )
+
+    out = consistency.report_without_private(report)
+    if page is not None:
+        out["items"] = [
+            ConsistencyDifferenceItem.model_validate(item) for item in page["items"]
+        ]
+        out["next_cursor"] = page["next_cursor"]
+        out["has_more"] = page["has_more"]
+    return ConsistencyCheckOut.model_validate(out)
 
 
 @app.get(

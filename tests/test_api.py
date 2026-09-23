@@ -326,3 +326,213 @@ def _registry():
     # 测试夹具 reload 过 app.jobs，必须经由 app.main 拿到同一份 registry
     from app.main import registry
     return registry
+
+
+# --------------------------------------------------------------------------- #
+# POST /jobs/consistency-check 差异明细分页（level / limit / cursor）
+# --------------------------------------------------------------------------- #
+def _cc(client, job_ids, **extra):
+    return client.post(
+        "/jobs/consistency-check", json={"job_ids": job_ids, **extra}
+    )
+
+
+def test_consistency_check_without_level_unchanged(client, sample_zip_bytes):
+    j1 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    body = _cc(client, [j1["id"], j2["id"]]).json()
+    # 不传 level：响应中不出现任何分页键（向后兼容）
+    assert "items" not in body
+    assert "next_cursor" not in body
+    assert "has_more" not in body
+    # 传入 cursor 但不传 level 时也不分页（cursor 被忽略，等同旧行为）
+    body2 = _cc(client, [j1["id"], j2["id"]], cursor="unused").json()
+    assert "items" not in body2
+
+
+def test_consistency_check_level_patient_first_page(client, sample_zip_bytes):
+    j1 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    r = _cc(client, [j1["id"], j2["id"]], level="patient", limit=1)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # 完整计数与 overall_status 仍然给出
+    assert body["overall_status"] == "consistent"
+    assert body["patient_mappings"]["checked_keys"] == 2
+    assert "summary" in body
+    # 两批完全相同：患者层无差异
+    assert body["items"] == []
+    assert body["has_more"] is False
+    assert body["next_cursor"] is None
+
+    # 删除 j2 的一名患者后，患者层出现 1 条覆盖差异
+    j2_obj = _registry().get(j2["id"])
+    j2_obj.result.patients.pop("id:P-002", None)
+    body = _cc(client, [j1["id"], j2["id"]], level="patient", limit=10).json()
+    assert len(body["items"]) == 1
+    item = body["items"][0]
+    assert item["level"] == "patient"
+    assert item["patient_key"] == "id:P-002"
+    assert item["difference_type"] == "only_in_one_job"
+    assert item["present_in"] == [j1["id"]]
+    assert item["missing_in"] == [j2["id"]]
+    assert body["has_more"] is False
+    # 完整计数仍然给出
+    assert body["patient_mappings"]["only_in_one_job_count"] == 1
+
+
+def test_consistency_check_pagination_walks_all_pages(client, sample_zip_bytes):
+    j1 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    # 让 j2 只保留 4 个 SOP（见 overlapping 用例的做法），制造覆盖差异
+    j2_obj = _registry().get(j2["id"])
+    j2_obj.result.sops = dict(list(j2_obj.result.sops.items())[:1])
+
+    cursor = None
+    keys: list[tuple] = []
+    pages = 0
+    while True:
+        payload = {"job_ids": [j1["id"], j2["id"]], "level": "sop", "limit": 2}
+        if cursor:
+            payload["cursor"] = cursor
+        body = client.post(
+            "/jobs/consistency-check", json=payload
+        ).json()
+        pages += 1
+        for item in body["items"]:
+            keys.append((item["difference_type"],
+                         item.get("old_uid") or item.get("new_uid")))
+        # 完整计数不随分页变化
+        assert body["uid_mappings"][2]["level"] == "sop"
+        assert body["summary"]["uid_only_in_one_job"] >= 3
+        if not body["has_more"]:
+            assert body["next_cursor"] is None
+            break
+        cursor = body["next_cursor"]
+        assert cursor and cursor != "null"
+        assert pages < 20
+
+    # 顺序符合固定业务键（本例无冲突/碰撞，全部为覆盖差异，按 old_uid 升序）
+    assert all(t == "only_in_one_job" for t, _ in keys)
+    assert keys == sorted(keys, key=lambda k: k[1])
+    assert pages >= 2
+
+
+def test_consistency_check_default_limit_50(client, sample_zip_bytes, monkeypatch):
+    j1 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2_obj = _registry().get(j2["id"])
+    j2_obj.result.sops = dict(list(j2_obj.result.sops.items())[:1])
+    # 不传 limit 也应返回分页结构（默认页长 50，差异不足一页）
+    body = _cc(client, [j1["id"], j2["id"]], level="series").json()
+    assert body["has_more"] is False
+    assert "items" in body
+    assert "next_cursor" in body
+
+
+def test_consistency_check_limit_bounds_422(client, sample_zip_bytes):
+    j1 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    assert _cc(client, [j1["id"], j2["id"]], level="sop", limit=0).status_code == 422
+    assert _cc(client, [j1["id"], j2["id"]], level="sop", limit=201).status_code == 422
+    assert _cc(client, [j1["id"], j2["id"]], level="sop",
+               limit="abc").status_code == 422
+    assert _cc(client, [j1["id"], j2["id"]], level="modality").status_code == 422
+
+
+def test_consistency_check_limit_respected(client, sample_zip_bytes):
+    j1 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2_obj = _registry().get(j2["id"])
+    j2_obj.result.sops = dict(list(j2_obj.result.sops.items())[:1])
+    body = _cc(client, [j1["id"], j2["id"]], level="sop", limit=1).json()
+    assert len(body["items"]) == 1
+    assert body["has_more"] is True
+    assert body["next_cursor"]
+
+
+def test_consistency_check_cursor_tampered_400(client, sample_zip_bytes):
+    j1 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2_obj = _registry().get(j2["id"])
+    j2_obj.result.sops = dict(list(j2_obj.result.sops.items())[:1])
+    body = _cc(client, [j1["id"], j2["id"]], level="sop", limit=1).json()
+    cursor = body["next_cursor"]
+
+    for bad in (cursor[:-3] + "xxx", "garbage", "a.b", "....", cursor.upper()):
+        r = _cc(client, [j1["id"], j2["id"]], level="sop", limit=1, cursor=bad)
+        assert r.status_code == 400, bad
+        assert r.json()["detail"]["code"] == "INVALID_CURSOR"
+
+
+def test_consistency_check_cursor_cross_scope_400(client, sample_zip_bytes):
+    j1 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j3 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    for job in (j2, j3):
+        obj = _registry().get(job["id"])
+        obj.result.sops = dict(list(obj.result.sops.items())[:1])
+
+    cursor = _cc(client, [j1["id"], j2["id"]], level="sop", limit=1).json()["next_cursor"]
+
+    # 跨任务集合复用
+    r = _cc(client, [j1["id"], j3["id"]], level="sop", limit=1, cursor=cursor)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "CURSOR_SCOPE_MISMATCH"
+
+    # 跨 level 复用
+    r = _cc(client, [j1["id"], j2["id"]], level="study", limit=1, cursor=cursor)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "CURSOR_SCOPE_MISMATCH"
+
+    # 任务集合相同但请求顺序不同：属于同一集合，允许复用
+    r = _cc(client, [j2["id"], j1["id"]], level="sop", limit=1, cursor=cursor)
+    assert r.status_code == 200, r.text
+
+
+def test_consistency_check_cursor_expired_400(client, sample_zip_bytes, monkeypatch):
+    from app.main import pagination
+
+    j1 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2_obj = _registry().get(j2["id"])
+    j2_obj.result.sops = dict(list(j2_obj.result.sops.items())[:1])
+
+    real_time = pagination.time.time
+    # 签发时间固定在“过去”
+    monkeypatch.setattr(pagination.time, "time", lambda: real_time() - 10000)
+    cursor = _cc(client, [j1["id"], j2["id"]], level="sop", limit=1).json()["next_cursor"]
+    monkeypatch.undo()
+    r = _cc(client, [j1["id"], j2["id"]], level="sop", limit=1, cursor=cursor)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "CURSOR_EXPIRED"
+
+
+def test_consistency_check_cursor_without_level_ignored(client, sample_zip_bytes):
+    j1 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    # 未请求分页时即便携带非法 cursor 也不报错（cursor 不参与）
+    r = _cc(client, [j1["id"], j2["id"]], cursor="garbage")
+    assert r.status_code == 200
+    assert "items" not in r.json()
+
+
+def test_consistency_check_cursor_job_errors_take_precedence(client, sample_zip_bytes):
+    j1 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2 = _upload(client, sample_zip_bytes, "page-secret-12345")
+    j2_obj = _registry().get(j2["id"])
+    j2_obj.result.sops = dict(list(j2_obj.result.sops.items())[:1])
+    cursor = _cc(client, [j1["id"], j2["id"]], level="sop", limit=1).json()["next_cursor"]
+    # 任务不存在优先 404，密钥不一致优先 409，均早于游标校验
+    r = _cc(client, [j1["id"], "missing"], level="sop", cursor=cursor)
+    assert r.status_code == 404
+
+    j_other = _upload(client, sample_zip_bytes, "page-secret-DIFFERENT")
+    r = _cc(client, [j1["id"], j_other["id"]], level="sop", cursor=cursor)
+    assert r.status_code == 409
+
+
+def _registry():
+    # 测试夹具 reload 过 app.jobs，必须经由 app.main 拿到同一份 registry
+    from app.main import registry
+    return registry

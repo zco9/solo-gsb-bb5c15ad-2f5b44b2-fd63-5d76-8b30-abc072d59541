@@ -29,6 +29,8 @@ class Settings:
     job_ttl_seconds: int = _int("DICOM_ANON_JOB_TTL_SECONDS", 3600)
     # 稳定密钥的最小长度
     min_secret_length: int = _int("DICOM_ANON_MIN_SECRET_LENGTH", 8)
+    # 一致性核对分页游标的有效期（秒）；过期游标必须重新从第一页开始
+    cursor_ttl_seconds: int = _int("DICOM_ANON_CURSOR_TTL_SECONDS", 900)
 
 
 settings = Settings()

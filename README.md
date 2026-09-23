@@ -68,7 +68,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/jobs` | 上传 ZIP（multipart），同步处理并返回完整标签变更预览与诊断 |
-| `POST` | `/jobs/consistency-check` | 核对 2～5 个已完成任务的密钥指纹、患者伪名与 Study/Series/SOP UID 映射 |
+| `POST` | `/jobs/consistency-check` | 核对 2～5 个已完成任务的密钥指纹、患者伪名与 Study/Series/SOP UID 映射；支持差异明细分页（`level`/`limit`/`cursor`） |
 | `GET` | `/jobs/{job_id}` | 获取任务结果（预览 + 诊断 + UID 映射概览） |
 | `GET` | `/jobs/{job_id}/files` | 仅获取逐文件诊断与变更列表 |
 | `GET` | `/jobs/{job_id}/download` | 下载匿名化后的 ZIP |
@@ -146,6 +146,78 @@ open("anonymized.zip", "wb").write(
 
 - 数组长度必须为 **2～5**，元素不可重复、不可为空白字符串，否则 `422`。
 
+### 差异明细分页（`level` / `limit` / `cursor`）
+
+当差异明细很多（例如跨大批次时 `only_in_one_job` 可能成千上万），可在请求中追加
+`level` 对**单个层级**的差异明细做游标分页，响应会在顶层额外返回 `items` /
+`next_cursor` / `has_more`；原有的完整计数（`*_count`、`summary`）与 `overall_status`
+**始终完整给出，不受分页影响**。不传 `level` 时响应与旧版本完全一致（不出现任何
+分页字段）。
+
+请求字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `level` | string | 否 | `patient` / `study` / `series` / `sop`；不传则返回旧版完整报告 |
+| `limit` | integer | 否 | 每页条数，**1～200**（越界返回 `422`）；缺省 50 |
+| `cursor` | string | 否 | 上一页响应中的不透明 `next_cursor`，首页不传 |
+
+```json
+{"job_ids": ["0d03…", "7f2a…"], "level": "sop", "limit": 100}
+```
+
+响应在原报告基础上新增三个顶层字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `items` | 当前层级本页的差异明细，按**固定业务键**稳定排序 |
+| `next_cursor` | 下一页不透明游标；`has_more=false` 时为 `null` |
+| `has_more` | 该层级是否还有后续明细 |
+
+排序规则（固定业务键，先类型后标识，均为字典序，与比对执行顺序无关）：
+
+1. `conflict`（患者层含 `date_shift_mismatch`）→ `uid_new_collision` → `only_in_one_job`；
+2. 同类型内：患者层按 `patient_key`；UID 层按 `old_uid`，碰撞条目按 `new_uid`。
+
+游标安全语义（不透明、HMAC 签名，默认有效期 **15 分钟**）：
+
+- 游标载荷绑定**任务集合**（排序后的 `job_ids`）与**筛选条件**（`level`）；
+- 被**篡改**或格式非法、**过期**、或复用到**其他任务集合 / 其他 level** 时返回 `400`
+  （`detail.code` 分别为 `INVALID_CURSOR` / `CURSOR_EXPIRED` / `CURSOR_SCOPE_MISMATCH`），
+  此时应丢弃游标、从第一页重新开始；
+- 同一任务集合以不同顺序请求视为相同作用域，游标可继续使用；
+- 游标不含 `limit`，可用不同页长继续翻页；服务重启后进程级签名密钥轮换，旧游标
+  按篡改处理（`400`）。
+
+> 注意：报告内嵌的 `patient_mappings.differences` 与各层 `uid_mappings[].differences`
+> 仍按原口径截断（每层最多 500 条，冲突/碰撞始终完整）；**完整明细通过分页接口获取**，
+> 截断时 `differences_truncated=true`，计数始终完整。
+
+翻页示例（Python）：
+
+```python
+job_ids = [job1_id, job2_id]
+cursor = None
+while True:
+    body = {"job_ids": job_ids, "level": "sop", "limit": 200}
+    if cursor:
+        body["cursor"] = cursor
+    resp = requests.post(
+        "http://localhost:8000/jobs/consistency-check", json=body
+    )
+    if resp.status_code == 400:
+        # 游标篡改/过期/跨条件复用：回退到第一页
+        cursor = None
+        continue
+    resp.raise_for_status()
+    page = resp.json()
+    for item in page["items"]:
+        print(item["difference_type"], item.get("old_uid") or item.get("new_uid"))
+    if not page["has_more"]:
+        break
+    cursor = page["next_cursor"]
+```
+
 curl 示例：
 
 ```bash
@@ -222,6 +294,13 @@ else:
     "patient_only_in_one_job": 0,
     "uid_only_in_one_job": 0
   }
+  // 请求带 level 时，顶层还会出现：
+  // "items": [ {"level": "sop", "old_uid": "1.2.840.…",
+  //             "difference_type": "only_in_one_job",
+  //             "mappings": {"0d03…": "2.25.111…"},
+  //             "present_in": ["0d03…"], "missing_in": ["7f2a…"]} ],
+  // "next_cursor": "eyJ2Ijoi…（不透明，has_more=false 时为 null）",
+  // "has_more": true
 }
 ```
 
@@ -232,17 +311,21 @@ else:
   （`only_in_one_job`），不计为冲突；
 - 同一密钥下确定性派生理论上不会产生 `conflict` / `uid_new_collision`，出现这类结果
   意味着派生算法版本不一致或数据被篡改，应停止合并这些批次；
-- 差异明细每层最多返回 500 条（冲突/碰撞始终完整保留），超出时
-  `differences_truncated=true`，但各类 `*_count` 计数仍然完整。
+- 差异明细每层最多内嵌返回 500 条（冲突/碰撞始终完整保留），超出时
+  `differences_truncated=true`，但各类 `*_count` 计数仍然完整；需要完整明细时
+  使用 `level` + `limit` + `cursor` 分页参数逐层获取。
 
 错误响应（HTTP 4xx，`detail.code` 机器可读）：
 
 | 状态码 | `detail.code` | 触发条件 |
 | --- | --- | --- |
+| `400` | `INVALID_CURSOR` | 分页游标格式/签名非法、被篡改，或服务重启后旧游标失效 |
+| `400` | `CURSOR_EXPIRED` | 分页游标超过有效期（默认 15 分钟，需从第一页重新开始） |
+| `400` | `CURSOR_SCOPE_MISMATCH` | 游标复用到其他任务集合或其他 `level` |
 | `404` | `JOB_NOT_FOUND` | 任一任务 ID 不存在或已过期（`missing_job_ids` 给出缺失列表） |
 | `409` | `JOBS_NOT_COMPLETED` | 存在 `status != ready` 的任务（失败/未完成，见 `not_ready_jobs`） |
 | `409` | `SECRET_FINGERPRINT_MISMATCH` | 任务间密钥指纹不一致（`fingerprints` 给出各任务指纹） |
-| `422` | —（Pydantic 校验） | ID 数量不在 2～5、重复、空白，或请求体格式错误 |
+| `422` | —（Pydantic 校验） | ID 数量不在 2～5、重复、空白，`level` 非法，`limit` 不在 1～200，或请求体格式错误 |
 
 ---
 
@@ -370,6 +453,7 @@ else:
 | `DICOM_ANON_MAX_EXTRACTED_FILES` | `20000` | 解压文件数上限 |
 | `DICOM_ANON_JOB_TTL_SECONDS` | `3600` | 任务结果保留时长 |
 | `DICOM_ANON_MIN_SECRET_LENGTH` | `8` | 稳定密钥最小长度 |
+| `DICOM_ANON_CURSOR_TTL_SECONDS` | `900` | 一致性核对分页游标的有效期（秒） |
 
 ---
 
@@ -380,13 +464,14 @@ else:
 ├── app/
 │   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/download、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
-│   ├── consistency.py   # 跨任务一致性核对：密钥指纹/患者伪名/UID 映射比对
+│   ├── consistency.py   # 跨任务一致性核对：密钥指纹/患者伪名/UID 映射比对与差异明细分页
+│   ├── pagination.py    # 差异明细不透明分页游标：HMAC 签名、绑定任务集合/level、TTL
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 请求/响应模型（含一致性核对模型）
+│   ├── schemas.py       # 请求/响应模型（含一致性核对与分页模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对（49 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标（72 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
