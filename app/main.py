@@ -11,13 +11,14 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from .anonymizer import JobResult
-from . import consistency
+from . import consistency, pagination
 from .config import settings
 from .jobs import registry
 from .schemas import (
     ConsistencyCheckOut,
     ConsistencyCheckRequest,
     ConsistencyErrorDetail,
+    DifferencePage,
     FileOut,
     JobOut,
     PatientOut,
@@ -186,6 +187,8 @@ async def create_job(
     tags=["jobs"],
     summary="核对多个已完成任务的密钥指纹、患者稳定伪名与 Study/Series/SOP UID 映射",
     responses={
+        400: {"model": ConsistencyErrorDetail,
+              "description": "分页 cursor 非法：篡改、过期、跨任务集合或跨 level 复用"},
         404: {"model": ConsistencyErrorDetail, "description": "部分任务不存在或已过期"},
         409: {"model": ConsistencyErrorDetail,
               "description": "部分任务未完成，或任务间密钥指纹不一致"},
@@ -236,7 +239,45 @@ def consistency_check(body: ConsistencyCheckRequest) -> ConsistencyCheckOut:
             },
         )
 
-    return ConsistencyCheckOut.model_validate(consistency.build_report(jobs))
+    report = consistency.build_report(jobs)
+
+    # 差异明细分页：传入 level 或 cursor 即启用；cursor 必须绑定任务集合与层级
+    level = body.level
+    after_position = None
+    if body.cursor:
+        try:
+            level, after_position = pagination.decode_cursor(
+                body.cursor, body.job_ids, expected_level=body.level
+            )
+        except pagination.InvalidCursor as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "INVALID_CURSOR",
+                    "message": str(exc),
+                },
+            )
+
+    if level is not None:
+        limit = body.limit if body.limit is not None else 100
+        page = consistency.paginate(jobs, level, limit, after=after_position)
+        next_cursor = None
+        if page["has_more"]:
+            next_cursor = pagination.encode_cursor(
+                pagination.scope_hash(body.job_ids, level),
+                level,
+                page["next_position"],
+            )
+        report["difference_page"] = DifferencePage(
+            level=level,
+            limit=limit,
+            total=page["total"],
+            items=page["items"],
+            next_cursor=next_cursor,
+            has_more=page["has_more"],
+        )
+
+    return ConsistencyCheckOut.model_validate(report)
 
 
 @app.get(

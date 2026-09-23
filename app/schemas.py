@@ -1,9 +1,15 @@
 """API 响应模型（Pydantic v2）。"""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
+
+# 差异分页支持的层级
+ConsistencyLevel = Literal["patient", "study", "series", "sop"]
+# 分页单页条数上下限
+DIFF_PAGE_MIN_LIMIT = 1
+DIFF_PAGE_MAX_LIMIT = 200
 
 
 class DiagnosticOut(BaseModel):
@@ -97,6 +103,22 @@ class ConsistencyCheckRequest(BaseModel):
         description="已完成（status=ready）任务 ID，2～5 个；不得重复",
         min_length=2,
         max_length=5,
+    )
+    level: Optional[ConsistencyLevel] = Field(
+        default=None,
+        description="差异明细分页层级：patient | study | series | sop；"
+        "传入时响应附带 difference_page，不传时维持原有汇总报告（明细按上限截断）",
+    )
+    limit: Optional[int] = Field(
+        default=None,
+        ge=DIFF_PAGE_MIN_LIMIT,
+        le=DIFF_PAGE_MAX_LIMIT,
+        description="差异分页单页条数，1～200，默认 100；仅在 level/cursor 分页时生效",
+    )
+    cursor: Optional[str] = Field(
+        default=None,
+        description="上一页响应返回的不透明 next_cursor；cursor 绑定任务集合与 level，"
+        "篡改、过期或跨条件复用返回 400",
     )
 
     @field_validator("job_ids")
@@ -192,6 +214,22 @@ class UidLevelReport(BaseModel):
     differences: list[UidMappingDifference]
 
 
+class DifferencePage(BaseModel):
+    level: ConsistencyLevel = Field(description="本页明细所属层级")
+    limit: int = Field(description="本页实际使用的单页上限（1～200）")
+    total: int = Field(description="该层级差异明细**总条数**（不受分页影响，始终完整）")
+    items: list[Union[PatientMappingDifference, UidMappingDifference]] = Field(
+        description="当前页差异明细，按固定业务键升序：patient 为 patient_key；"
+        "UID 层级为 (差异类型, 原始 UID 或新 UID)"
+    )
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description="下一页不透明 cursor；has_more=false 时为 null。"
+        "cursor 绑定任务集合、level 并带过期时间",
+    )
+    has_more: bool = Field(description="是否还有下一页")
+
+
 class ConsistencyCheckOut(BaseModel):
     overall_status: str = Field(
         description="consistent（无任何冲突） | inconsistent（存在伪名或 UID 冲突）"
@@ -207,11 +245,17 @@ class ConsistencyCheckOut(BaseModel):
         "uid_conflict / uid_new_collision / "
         "patient_only_in_one_job / uid_only_in_one_job 计数"
     )
+    difference_page: Optional[DifferencePage] = Field(
+        default=None,
+        description="请求携带 level/cursor 时返回的差异明细分页；"
+        "不传 level 时为 null，报告维持原有形态（完整计数 + 截断明细）",
+    )
 
 
 class ConsistencyErrorDetail(BaseModel):
     code: str = Field(
-        description="JOB_NOT_FOUND | JOBS_NOT_COMPLETED | SECRET_FINGERPRINT_MISMATCH"
+        description="JOB_NOT_FOUND | JOBS_NOT_COMPLETED | "
+        "SECRET_FINGERPRINT_MISMATCH | INVALID_CURSOR"
     )
     message: str
     missing_job_ids: list[str] = []

@@ -270,3 +270,114 @@ def test_five_jobs_presence_ordering():
     assert [j.id for j in out.jobs] == ["j0", "j1", "j2", "j3", "j4"]
     assert out.overall_status == "consistent"
     assert out.patient_mappings.checked_keys == 1
+
+
+# --------------------------------------------------------------------------- #
+# 差异明细分页（固定业务键排序 + keyset 翻页）
+# --------------------------------------------------------------------------- #
+def test_patient_differences_sorted_by_patient_key():
+    j1 = _make_job("j1", patients={
+        f"id:P{i}": _patient(f"PID{i}", f"ANON^PID{i}", 10) for i in (3, 1, 2)
+    })
+    j2 = _make_job("j2", patients={
+        "id:P1": _patient("PID1", "ANON^PID1", 10),
+        "id:P3": _patient("PIDX", "ANON^PIDX", 10),  # P3 伪名冲突
+    })
+
+    items = consistency.level_differences([j1, j2], "patient")
+    keys = [d["patient_key"] for d in items]
+    assert keys == sorted(keys)
+    # P1 共同出现且一致 -> 不在差异列表；P2 覆盖差异；P3 冲突
+    assert keys == ["id:P2", "id:P3"]
+    assert next(d for d in items if d["patient_key"] == "id:P3")[
+        "difference_type"
+    ] == "conflict"
+
+
+def test_paginate_walks_all_items_without_gaps_or_duplicates():
+    j1 = _make_job("j1", sops={f"1.1.{i}": f"2.25.{100 + i}" for i in range(5)})
+    j2 = _make_job("j2", sops={"1.1.0": "2.25.100"})  # 仅 UID 0 共同出现
+
+    seen = []
+    position = None
+    for _ in range(10):
+        page = consistency.paginate([j1, j2], "sop", 2, after=position)
+        seen.extend(page["items"])
+        assert len(page["items"]) <= 2
+        if not page["has_more"]:
+            assert page["next_position"] is None
+            break
+        position = page["next_position"]
+    else:  # pragma: no cover - 分页未能收敛
+        raise AssertionError("分页未在预期页数内结束")
+
+    # 4 个 j1 独有 UID（1.1.0 共同出现且映射一致，不产生差异）= 4 条覆盖差异
+    keys = [d.get("old_uid") or d["new_uid"] for d in seen]
+    assert len(keys) == 4
+    assert len(keys) == len(set(keys))
+    assert keys == sorted(keys)
+
+
+def test_paginate_total_matches_full_level_list():
+    jobs = [
+        _make_job("j1", sops={"1.1.1": "2.25.1", "1.1.2": "2.25.2"}),
+        _make_job("j2", sops={"1.1.1": "2.25.1"}),
+    ]
+    full = consistency.level_differences(jobs, "sop")
+    page = consistency.paginate(jobs, "sop", 100)
+    assert len(full) == 1
+    assert page["has_more"] is False
+    assert page["items"][0]["old_uid"] == "1.1.2"
+    assert page["items"][0]["difference_type"] == "only_in_one_job"
+
+
+def test_paginate_limit_larger_than_total():
+    jobs = [
+        _make_job("j1", patients={"id:P1": _patient("A", "ANON^A", 1)}),
+        _make_job("j2"),
+    ]
+    page = consistency.paginate(jobs, "patient", 200)
+    assert page["has_more"] is False
+    assert len(page["items"]) == 1
+
+
+def test_uid_page_key_ordering_collisions_after_coverage():
+    # 同一新 UID 碰撞：两个原始 UID 各只在一个任务出现（覆盖差异）+ 一条碰撞
+    j1 = _make_job("j1", sops={"1.1.1": "2.25.same"})
+    j2 = _make_job("j2", sops={"1.1.2": "2.25.same"})
+
+    items = consistency.level_differences([j1, j2], "sop")
+    ranked = [(d["difference_type"], d.get("old_uid") or d["new_uid"])
+              for d in items]
+    # only_in_one_job(rank=0) 在 collision(rank=9) 之前；组内按业务键
+    assert ranked == [
+        ("only_in_one_job", "1.1.1"),
+        ("only_in_one_job", "1.1.2"),
+        ("uid_new_collision", "2.25.same"),
+    ]
+
+
+def test_paginate_deterministic_across_rebuilds():
+    # keyset 定位基于确定性重建的列表：同样的定位点连续翻页结果一致
+    jobs = [
+        _make_job("j1", sops={f"1.1.{i}": f"2.25.{i}" for i in range(4)}),
+        _make_job("j2", sops={"1.1.0": "2.25.0"}),
+    ]
+    page1 = consistency.paginate(jobs, "sop", 2)
+    page2 = consistency.paginate(jobs, "sop", 2, after=page1["next_position"])
+    page2_rebuilt = consistency.paginate(
+        jobs, "sop", 2, after=page1["next_position"]
+    )
+    assert [d["old_uid"] for d in page2["items"]] == [
+        d["old_uid"] for d in page2_rebuilt["items"]
+    ]
+
+
+def test_level_differences_empty_for_consistent_identical_jobs():
+    payload = dict(sops={"1.1.1": "2.25.1"})
+    j1 = _make_job("j1", **payload)
+    j2 = _make_job("j2", **payload)
+    for level in ("patient", "study", "series", "sop"):
+        assert consistency.level_differences([j1, j2], level) == []
+        page = consistency.paginate([j1, j2], level, 50)
+        assert page["items"] == [] and page["has_more"] is False

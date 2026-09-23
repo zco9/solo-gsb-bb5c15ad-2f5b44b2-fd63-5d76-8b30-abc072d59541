@@ -68,7 +68,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/jobs` | 上传 ZIP（multipart），同步处理并返回完整标签变更预览与诊断 |
-| `POST` | `/jobs/consistency-check` | 核对 2～5 个已完成任务的密钥指纹、患者伪名与 Study/Series/SOP UID 映射 |
+| `POST` | `/jobs/consistency-check` | 核对 2～5 个已完成任务的密钥指纹、患者伪名与 Study/Series/SOP UID 映射；支持 `level`/`limit`/`cursor` 差异明细分页 |
 | `GET` | `/jobs/{job_id}` | 获取任务结果（预览 + 诊断 + UID 映射概览） |
 | `GET` | `/jobs/{job_id}/files` | 仅获取逐文件诊断与变更列表 |
 | `GET` | `/jobs/{job_id}/download` | 下载匿名化后的 ZIP |
@@ -146,6 +146,71 @@ open("anonymized.zip", "wb").write(
 
 - 数组长度必须为 **2～5**，元素不可重复、不可为空白字符串，否则 `422`。
 
+### 差异明细分页（同一接口，可选参数）
+
+汇总响应始终给出**完整计数**与 `overall_status`。差异明细默认每层最多内嵌 500 条；
+当某层差异很多时，可通过同一 `POST /jobs/consistency-check` 接口的分页参数按
+**固定业务键**逐页拉取：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `level` | string | 否 | `patient` / `study` / `series` / `sop`；传入后响应附带 `difference_page` |
+| `limit` | int | 否 | 单页条数，**1～200**，默认 `100`；越界返回 `422` |
+| `cursor` | string | 否 | 上一页返回的 `next_cursor`；可不传 `level`（层级由 cursor 自身携带） |
+
+排序口径（固定业务键，全程稳定）：
+
+- `patient`：按 `patient_key` 升序；
+- `study` / `series` / `sop`：按 `(差异类型, 业务 UID)` 升序——
+  `only_in_one_job` / `conflict` 以**原始 UID** 为键，
+  `uid_new_collision` 以**新 UID** 为键；冲突/碰撞/覆盖差异在同一序列中混合排序。
+
+`cursor` 为不透明字符串，内部用**进程内随机密钥做 HMAC-SHA256 签名**，并绑定：
+
+- 参与核对的**任务集合**（有序 `job_ids`，换任务或调换顺序都不可复用）；
+- 筛选的 **level**（不可跨层级复用）；
+- 签发时间与过期时间（默认 10 分钟，可用 `DICOM_ANON_CURSOR_TTL_SECONDS` 调整；
+  服务重启后旧 cursor 同样失效）。
+
+篡改、过期或跨条件复用 cursor 统一返回 **`400 INVALID_CURSOR`**，
+客户端应丢弃该 cursor 并从第一页重新开始。
+
+分页响应在原报告基础上新增 `difference_page`：
+
+```jsonc
+{
+  "overall_status": "consistent",   // 原有汇总字段全部保留
+  "summary": { /* …完整计数，不受分页影响… */ },
+  "patient_mappings": { /* … */ },
+  "uid_mappings": [ /* … */ ],
+  "difference_page": {
+    "level": "sop",
+    "limit": 2,
+    "total": 12,                    // 该层级差异总条数（与 *_count 一致，始终完整）
+    "items": [ /* 至多 limit 条，按固定业务键升序 */ ],
+    "next_cursor": "eyJ…(不透明)…",  // has_more=false 时为 null
+    "has_more": true
+  }
+}
+```
+
+分页翻页 curl 示例：
+
+```bash
+# 第一页
+curl -s -X POST http://localhost:8000/jobs/consistency-check \
+  -H "Content-Type: application/json" \
+  -d '{"job_ids": ["0d03…", "7f2a…"], "level": "sop", "limit": 50}' > page1.json
+
+# 后续页：回传 next_cursor（level 可省略，limit 可按页调整，范围仍为 1～200）
+CURSOR=$(python3 -c "import json;print(json.load(open('page1.json'))['difference_page']['next_cursor'])")
+curl -X POST http://localhost:8000/jobs/consistency-check \
+  -H "Content-Type: application/json" \
+  -d "{\"job_ids\": [\"0d03…\", \"7f2a…\"], \"cursor\": \"$CURSOR\", \"limit\": 50}"
+```
+
+不分页（不传 `level`/`cursor`）时响应与旧版完全一致，`difference_page` 为 `null`。
+
 curl 示例：
 
 ```bash
@@ -169,6 +234,21 @@ else:
     report = resp.json()
     print(report["overall_status"])      # consistent | inconsistent
     print(report["summary"])             # 各类冲突/覆盖差异计数
+
+# 差异明细分页遍历（以 sop 层为例）
+cursor = None
+while True:
+    body = {"job_ids": [job1_id, job2_id], "level": "sop", "limit": 200}
+    if cursor:
+        body["cursor"] = cursor
+    page = requests.post(
+        "http://localhost:8000/jobs/consistency-check", json=body
+    ).json()["difference_page"]
+    for item in page["items"]:
+        print(item["difference_type"], item.get("old_uid") or item.get("new_uid"))
+    if not page["has_more"]:
+        break
+    cursor = page["next_cursor"]          # 不透明；400 INVALID_CURSOR 时重新从首页开始
 ```
 
 响应示例：
@@ -232,17 +312,20 @@ else:
   （`only_in_one_job`），不计为冲突；
 - 同一密钥下确定性派生理论上不会产生 `conflict` / `uid_new_collision`，出现这类结果
   意味着派生算法版本不一致或数据被篡改，应停止合并这些批次；
-- 差异明细每层最多返回 500 条（冲突/碰撞始终完整保留），超出时
-  `differences_truncated=true`，但各类 `*_count` 计数仍然完整。
+- 不分页时差异明细每层最多返回 500 条（冲突/碰撞始终完整保留），超出时
+  `differences_truncated=true`，但各类 `*_count` 计数仍然完整；需要拉取全部明细时
+  使用 `level` + `limit` + `cursor` 分页（`difference_page.total` 与对应 `*_count`
+  一致，始终完整）。
 
 错误响应（HTTP 4xx，`detail.code` 机器可读）：
 
 | 状态码 | `detail.code` | 触发条件 |
 | --- | --- | --- |
+| `400` | `INVALID_CURSOR` | 分页 cursor 被篡改、已过期（默认 10 分钟）、跨任务集合或跨 level 复用 |
 | `404` | `JOB_NOT_FOUND` | 任一任务 ID 不存在或已过期（`missing_job_ids` 给出缺失列表） |
 | `409` | `JOBS_NOT_COMPLETED` | 存在 `status != ready` 的任务（失败/未完成，见 `not_ready_jobs`） |
 | `409` | `SECRET_FINGERPRINT_MISMATCH` | 任务间密钥指纹不一致（`fingerprints` 给出各任务指纹） |
-| `422` | —（Pydantic 校验） | ID 数量不在 2～5、重复、空白，或请求体格式错误 |
+| `422` | —（Pydantic 校验） | ID 数量不在 2～5、重复、空白，`level` 非法，`limit` 超出 1～200，或请求体格式错误 |
 
 ---
 
@@ -369,6 +452,7 @@ else:
 | `DICOM_ANON_MAX_EXTRACTED_BYTES` | `2147483648`（2 GiB） | 解压总量上限 |
 | `DICOM_ANON_MAX_EXTRACTED_FILES` | `20000` | 解压文件数上限 |
 | `DICOM_ANON_JOB_TTL_SECONDS` | `3600` | 任务结果保留时长 |
+| `DICOM_ANON_CURSOR_TTL_SECONDS` | `600` | 一致性核对差异分页 cursor 的有效期 |
 | `DICOM_ANON_MIN_SECRET_LENGTH` | `8` | 稳定密钥最小长度 |
 
 ---
@@ -380,13 +464,14 @@ else:
 ├── app/
 │   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/download、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
-│   ├── consistency.py   # 跨任务一致性核对：密钥指纹/患者伪名/UID 映射比对
+│   ├── consistency.py   # 跨任务一致性核对：密钥指纹/患者伪名/UID 映射比对与差异分页
+│   ├── pagination.py    # 差异分页 cursor：HMAC 签名、任务集合/层级绑定、过期校验
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 请求/响应模型（含一致性核对模型）
+│   ├── schemas.py       # 请求/响应模型（含一致性核对与分页模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对（49 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / cursor 分页（87 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

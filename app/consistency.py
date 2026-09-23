@@ -10,16 +10,29 @@
   出现意味着版本/密钥派生逻辑不一致）；
 * ``only_in_one_job`` —— 该标识仅出现在部分任务中，属于批次覆盖范围差异，不是冲突；
 * ``uid_new_collision`` —— 不同原始 UID 在不同任务中派生出相同新 UID。
+
+差异分页（``level_differences`` / ``paginate``）按**固定业务键**排序：
+* patient：业务键为 patient_key；
+* study/series/sop：业务键为 (difference_type_rank, old_uid 或 new_uid)，
+  其中 uid_new_collision 以新 UID 作为业务键。
 """
 from __future__ import annotations
 
 from collections import defaultdict
+from typing import Any, Optional
 
 from .anonymizer import JobResult
 from .jobs import Job
 
-# 每个 UID 层级差异明细条目上限（计数始终完整，仅截断明细，防止 JSON 过大）
+# 每个 UID 层级差异明细条目上限（计数始终完整，仅截断非分页响应中的明细，防止 JSON 过大）
 _MAX_DIFF_ENTRIES_PER_LEVEL = 500
+# 患者层明细条目上限（同上）
+_MAX_PATIENT_DIFF_ENTRIES = 500
+
+# uid_new_collision 没有原始 UID，排序时排在同类型内部并以新 UID 定位
+_COLLISION_RANK = 9
+
+_LEVELS = ("patient", "study", "series", "sop")
 
 
 def _job_counts(job: Job) -> dict[str, int]:
@@ -53,7 +66,8 @@ def build_job_summary(job: Job) -> dict:
 # --------------------------------------------------------------------------- #
 # 患者映射
 # --------------------------------------------------------------------------- #
-def _compare_patients(jobs: list[Job]) -> dict:
+def _build_patient_differences(jobs: list[Job]) -> tuple[list[dict], int]:
+    """返回 (按 patient_key 排序的全部差异, 实际比对过的 key 数)。"""
     # patient_key -> job_id -> 伪名/偏移
     per_key: dict[str, dict[str, dict]] = defaultdict(dict)
     for job in jobs:
@@ -65,11 +79,8 @@ def _compare_patients(jobs: list[Job]) -> dict:
             }
 
     job_ids = [j.id for j in jobs]
-    differences = []
+    differences: list[dict] = []
     checked_keys = 0
-    conflict_count = 0
-    shift_mismatch_count = 0
-    only_count = 0
 
     for key in sorted(per_key):
         appearances = per_key[key]
@@ -84,7 +95,6 @@ def _compare_patients(jobs: list[Job]) -> dict:
             shifts = {v["date_shift_days"] for v in appearances.values()}
             if len(ids) > 1 or len(names) > 1:
                 # 同一患者派生出不同伪名：确定性派生被破坏（真正的冲突）
-                conflict_count += 1
                 differences.append({
                     "patient_key": key,
                     "difference_type": "conflict",
@@ -94,7 +104,6 @@ def _compare_patients(jobs: list[Job]) -> dict:
                 })
             elif len(shifts) > 1:
                 # 伪名一致但日期偏移不同：通常因各任务 shift_dates 开关不同
-                shift_mismatch_count += 1
                 differences.append({
                     "patient_key": key,
                     "difference_type": "date_shift_mismatch",
@@ -103,7 +112,6 @@ def _compare_patients(jobs: list[Job]) -> dict:
                     "missing_in": [],
                 })
         else:
-            only_count += 1
             differences.append({
                 "patient_key": key,
                 "difference_type": "only_in_one_job",
@@ -112,13 +120,25 @@ def _compare_patients(jobs: list[Job]) -> dict:
                 "missing_in": missing,
             })
 
+    return differences, checked_keys
+
+
+def _compare_patients(jobs: list[Job]) -> dict:
+    differences, checked_keys = _build_patient_differences(jobs)
+
+    def _count(diff_type: str) -> int:
+        return sum(d["difference_type"] == diff_type for d in differences)
+
+    # 非分页响应仍对明细做上限截断（计数始终完整）
+    kept = differences[:_MAX_PATIENT_DIFF_ENTRIES]
     shift_consistent = len({j.shift_dates for j in jobs}) == 1
     return {
         "checked_keys": checked_keys,
-        "conflict_count": conflict_count,
-        "date_shift_mismatch_count": shift_mismatch_count,
-        "only_in_one_job_count": only_count,
-        "differences": differences,
+        "conflict_count": _count("conflict"),
+        "date_shift_mismatch_count": _count("date_shift_mismatch"),
+        "only_in_one_job_count": _count("only_in_one_job"),
+        "differences_truncated": len(kept) < len(differences),
+        "differences": kept,
         "shift_dates_consistent": shift_consistent,
     }
 
@@ -154,7 +174,14 @@ def _uid_layer(jobs: list[Job], level: str) -> tuple[dict[str, dict[str, str]],
     return by_old, by_new
 
 
-def _compare_uid_level(jobs: list[Job], level: str) -> dict:
+def _build_uid_differences(
+    jobs: list[Job], level: str
+) -> tuple[list[dict], list[dict], list[dict], int, int]:
+    """收集单个 UID 层级的全部差异（不截断）。
+
+    返回 (conflicts, collisions, coverage, checked, only_count)，
+    其中 collisions/coverage 已按固定业务键排序，conflicts 保持原始 UID 顺序。
+    """
     by_old, by_new = _uid_layer(jobs, level)
     job_ids = [j.id for j in jobs]
     conflicts: list[dict] = []
@@ -192,11 +219,9 @@ def _compare_uid_level(jobs: list[Job], level: str) -> dict:
             })
 
     # 2) 新 UID 碰撞：同一新 UID 对应 >=2 个不同原始 UID
-    collision_count = 0
     for new_uid in sorted(by_new):
         sources = by_new[new_uid]
         if len(set(sources.values())) > 1:
-            collision_count += 1
             collisions.append({
                 "level": level,
                 "old_uid": None,
@@ -207,18 +232,89 @@ def _compare_uid_level(jobs: list[Job], level: str) -> dict:
                 "missing_in": [jid for jid in job_ids if jid not in sources],
             })
 
-    # 冲突/碰撞是关键差异，始终完整给出；覆盖范围差异可能成千上万，仅保留前若干条
+    return conflicts, collisions, coverage, checked, only_count
+
+
+def _compare_uid_level(jobs: list[Job], level: str) -> dict:
+    conflicts, collisions, coverage, checked, only_count = _build_uid_differences(
+        jobs, level
+    )
+
+    # 非分页响应：冲突/碰撞是关键差异，始终完整给出；覆盖范围差异可能成千上万，
+    # 仅保留前若干条（conflicts + collisions + 前 N 条 coverage）
     budget = _MAX_DIFF_ENTRIES_PER_LEVEL - len(conflicts) - len(collisions)
     kept_coverage = coverage[:max(budget, 0)]
-    truncated = len(kept_coverage) < len(coverage)
+    all_count = len(conflicts) + len(collisions) + len(coverage)
+    kept = conflicts + collisions + kept_coverage
     return {
         "level": level,
         "checked_old_uids": checked,
         "conflict_count": len(conflicts),
         "only_in_one_job_count": only_count,
-        "new_uid_collision_count": collision_count,
-        "differences_truncated": truncated,
-        "differences": conflicts + collisions + kept_coverage,
+        "new_uid_collision_count": len(collisions),
+        "differences_truncated": len(kept) < all_count,
+        "differences": kept,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 差异分页（固定业务键排序 + keyset cursor 定位）
+# --------------------------------------------------------------------------- #
+def _page_key(diff: dict) -> list[Any]:
+    """返回差异条目的固定排序键（同时作为 cursor 定位点）。"""
+    diff_type = diff["difference_type"]
+    if "patient_key" in diff:
+        return [diff["patient_key"]]
+    if diff_type == "uid_new_collision":
+        return [str(_COLLISION_RANK), diff["new_uid"]]
+    # conflict / only_in_one_job 以原始 UID 为业务键；用 rank 段隔离两类
+    rank = 0 if diff_type == "only_in_one_job" else 1
+    return [str(rank), diff["old_uid"]]
+
+
+def level_differences(jobs: list[Job], level: str) -> list[dict]:
+    """收集指定层级的全部差异，按固定业务键排序。"""
+    if level == "patient":
+        differences, _ = _build_patient_differences(jobs)
+        return sorted(differences, key=_page_key)
+
+    conflicts, collisions, coverage, _, _ = _build_uid_differences(jobs, level)
+    return sorted(conflicts + collisions + coverage, key=_page_key)
+
+
+def paginate(
+    jobs: list[Job],
+    level: str,
+    limit: int,
+    after: Optional[list[Any]] = None,
+) -> dict:
+    """按固定业务键返回一页差异。
+
+    返回 ``{"items", "total", "has_more", "next_position"}``；``next_position`` 为
+    本页最后一条的业务键（调用方负责签发 cursor），无下一页时为 None。
+    """
+    ordered = level_differences(jobs, level)
+    total = len(ordered)
+    start = 0
+    if after is not None:
+        # 定位点必须严格大于 cursor 中的业务键；数据确定性重建，直接线性跳过
+        for index, diff in enumerate(ordered):
+            if _page_key(diff) >= after:
+                start = index
+                break
+        else:
+            start = total
+        # 跳过与定位点相等的条目（上一页最后一条本身）
+        while start < total and _page_key(ordered[start]) == after:
+            start += 1
+
+    page = ordered[start:start + limit]
+    has_more = start + limit < total
+    return {
+        "items": page,
+        "total": total,
+        "has_more": has_more,
+        "next_position": _page_key(page[-1]) if has_more and page else None,
     }
 
 

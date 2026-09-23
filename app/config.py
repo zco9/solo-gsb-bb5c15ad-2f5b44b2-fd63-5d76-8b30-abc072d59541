@@ -29,6 +29,8 @@ class Settings:
     job_ttl_seconds: int = _int("DICOM_ANON_JOB_TTL_SECONDS", 3600)
     # 稳定密钥的最小长度
     min_secret_length: int = _int("DICOM_ANON_MIN_SECRET_LENGTH", 8)
+    # 一致性核对差异分页 cursor 的有效期（秒）
+    cursor_ttl_seconds: int = _int("DICOM_ANON_CURSOR_TTL_SECONDS", 600)
 
 
 settings = Settings()
